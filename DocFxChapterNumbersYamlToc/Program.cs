@@ -1,15 +1,13 @@
-﻿using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Text;
-using Markdig;
+﻿using Markdig;
 using Markdig.Extensions.Tables;
 using Markdig.Helpers;
 using Markdig.Parsers;
 using Markdig.Renderers.Normalize;
 using Markdig.Syntax;
 using Markdig.Syntax.Inlines;
+using System.Text;
+using YamlDotNet.RepresentationModel;
+using YamlDotNet.Serialization;
 
 namespace DocFxChapterNumbers
 {
@@ -20,9 +18,9 @@ namespace DocFxChapterNumbers
             try
             {
                 bool force = false;
-                if (args.Length < 3)
+                if (args.Length < 2)
                 {
-                    Console.Error.WriteLine("Usage: {0} TOC.MD TARGETDIRECTORY [--force]",
+                    Console.Error.WriteLine("Usage: {0} TOC.MD|TOC.YML TARGETDIRECTORY [--force]",
                         typeof(Program).Assembly.GetName().Name);
                     return 1;
                 }
@@ -33,7 +31,7 @@ namespace DocFxChapterNumbers
                 }
 
                 string tocFile = Path.GetFullPath(args[0]);
-                string sourceDirectory = Path.GetDirectoryName(tocFile);
+                string sourceDirectory = Path.GetDirectoryName(tocFile)!;
                 string targetDirectory = Path.GetFullPath(args[1]);
 
                 if (!File.Exists(tocFile))
@@ -53,17 +51,31 @@ namespace DocFxChapterNumbers
                     Directory.CreateDirectory(targetDirectory);
                 }
 
-                var files = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                var doc = LoadDocument(tocFile);
-                files.Add(tocFile);
+                var files = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { tocFile };
+                string extension = Path.GetExtension(tocFile);
 
-                ProcessToc(doc, sourceDirectory, files, targetDirectory, tocFile);
+                if (".yml".Equals(extension, StringComparison.OrdinalIgnoreCase))
+                {
+                    Console.WriteLine("Processing a YAML toc...");
+                    ProcessYamlToc(sourceDirectory, tocFile, files, targetDirectory);
+                }
+                else if (".md".Equals(extension, StringComparison.OrdinalIgnoreCase))
+                {
+                    Console.WriteLine("Processing a Markdown toc...");
+                    ProcessMarkdownToc(sourceDirectory, files, targetDirectory, tocFile);
+                }
+                else
+                {
+                    Console.Error.WriteLine("Error: TOC file must have '.md' or '.yml' extension.");
+                    return 1;
+                }
+
                 CopyAuxiliaryFiles(sourceDirectory, files, targetDirectory);
             }
             catch (Exception ex)
             {
                 Console.Error.WriteLine("Error: {0}", ex.Message);
-                Console.Error.WriteLine(ex);
+                Console.Error.WriteLine(ex.StackTrace);
                 return ex.HResult;
             }
 
@@ -79,7 +91,7 @@ namespace DocFxChapterNumbers
                     string targetFile = GetOutputFullName(sourceDirectory, targetDirectory, file);
                     Console.WriteLine("Copying {0} -> {1}", Path.GetFileName(file), targetFile);
 
-                    string directoryName = Path.GetDirectoryName(targetFile);
+                    string directoryName = Path.GetDirectoryName(targetFile)!;
                     if (!Directory.Exists(directoryName))
                     {
                         Directory.CreateDirectory(directoryName);
@@ -90,10 +102,83 @@ namespace DocFxChapterNumbers
             }
         }
 
-        private static void ProcessToc(MarkdownDocument doc, string sourceDirectory, HashSet<string> files, string targetDirectory, string tocFile)
+        private static void ProcessYamlToc(string sourceDirectory, string tocFile, HashSet<string> files, string targetDirectory)
         {
+            var input = new StreamReader(tocFile);
+            var yaml = new YamlStream();
+            yaml.Load(input);
+
+            var root = (YamlMappingNode)yaml.Documents[0].RootNode;
+
+            if (!root.Children.TryGetValue(new YamlScalarNode("items"), out var itemsNode))
+            {
+                Console.Error.WriteLine("Error: 'items' node not found in toc.yml.");
+                return;
+            }
+
             var chapter = new Chapter();
-            string currentLevel1Heading = null;
+
+            ProcessYamlItemsRecursive((YamlSequenceNode)itemsNode, chapter, sourceDirectory, targetDirectory, files, 1);
+
+            CopyAuxiliaryFiles(sourceDirectory, files, targetDirectory);
+
+            // Write the modified YAML to the target directory
+            var outputTocFile = Path.Combine(targetDirectory, Path.GetFileName(tocFile));
+            using (var writer = new StreamWriter(outputTocFile))
+            {
+                yaml.Save(writer, assignAnchors: false);
+            }
+        }
+
+        private static void ProcessYamlItemsRecursive(
+            YamlSequenceNode itemsNode,
+            Chapter chapter,
+            string sourceDirectory,
+            string targetDirectory,
+            HashSet<string> files,
+            int level)
+        {
+            foreach (YamlMappingNode item in itemsNode)
+            {
+                chapter.IncrementLevel(level); // TOC hierarchy level (Level 2+)
+
+                // Update name
+                if (item.Children.TryGetValue("name", out var nameNode) && nameNode is YamlScalarNode nameScalar)
+                {
+                    nameScalar.Value = $"{chapter} {nameScalar.Value}";
+                }
+
+                // Process href .md file
+                if (item.Children.TryGetValue("href", out var hrefNode) && hrefNode is YamlScalarNode hrefScalar)
+                {
+                    var contentFile = Path.Combine(sourceDirectory, hrefScalar.Value).Replace('/', '\\');
+                    files.Add(contentFile);
+                    if (File.Exists(contentFile))
+                    {
+                        var targetFile = contentFile.Replace(sourceDirectory, targetDirectory);
+                        string dummyHeading = null;
+                        ProcessContentFile(new Chapter(chapter), contentFile, targetFile, ref dummyHeading);
+                    }
+                    else
+                    {
+                        Console.Error.WriteLine($"Warning: content file '{contentFile}' not found.");
+                    }
+                }
+
+                // Recursively process nested items
+                if (item.Children.TryGetValue("items", out var subItems) && subItems is YamlSequenceNode subSequence)
+                {
+                    ProcessYamlItemsRecursive(subSequence, new Chapter(chapter), sourceDirectory, targetDirectory, files, level + 1);
+                }
+            }
+        }
+
+        private static void ProcessMarkdownToc(string sourceDirectory, HashSet<string> files, string targetDirectory, string tocFile)
+        {
+            var doc = LoadMarkdownDocument(tocFile);
+
+            var chapter = new Chapter();
+            string? currentLevel1Heading = null;
 
             foreach (var x in doc.Descendants<HeadingBlock>())
             {
@@ -102,35 +187,38 @@ namespace DocFxChapterNumbers
 
                 chapter.IncrementLevel(x.Level - 1);
 
-                foreach (var s in x.Inline)
+                if (x.Inline != null)
                 {
-                    if (s is LinkInline link)
+                    foreach (var s in x.Inline)
                     {
-                        if (link.FirstChild is LiteralInline name)
+                        if (s is LinkInline link)
                         {
-                            name.UpdateContent(c => chapter + " " + c);
-                            if (!string.IsNullOrEmpty(link.Url))
+                            if (link.FirstChild is LiteralInline name)
                             {
-                                string contentFile = Path.Combine(sourceDirectory, link.Url).Replace('/', '\\');
-                                files.Add(contentFile);
-                                if (!File.Exists(contentFile))
+                                name.UpdateContent(c => chapter + " " + c);
+                                if (!string.IsNullOrEmpty(link.Url))
                                 {
-                                    Console.Error.WriteLine("Warning: Content file '{0}' does not exist.", contentFile);
-                                }
-                                else
-                                {
-                                    string targetFile = GetOutputFullName(sourceDirectory, targetDirectory, contentFile);
-                                    ProcessContentFile(new Chapter(chapter), contentFile, targetFile, ref currentLevel1Heading);
+                                    string contentFile = Path.Combine(sourceDirectory, link.Url).Replace('/', '\\');
+                                    files.Add(contentFile);
+                                    if (!File.Exists(contentFile))
+                                    {
+                                        Console.Error.WriteLine("Warning: Content file '{0}' does not exist.", contentFile);
+                                    }
+                                    else
+                                    {
+                                        string targetFile = GetOutputFullName(sourceDirectory, targetDirectory, contentFile);
+                                        ProcessContentFile(new Chapter(chapter), contentFile, targetFile, ref currentLevel1Heading);
+                                    }
                                 }
                             }
                         }
-                    }
-                    else if (s is LiteralInline literal)
-                    {
-                        literal.UpdateContent(c => chapter + " " + c);
-                        if (x.Level == 2)
+                        else if (s is LiteralInline literal)
                         {
-                            currentLevel1Heading = literal.Content.ToString();
+                            literal.UpdateContent(c => chapter + " " + c);
+                            if (x.Level == 2)
+                            {
+                                currentLevel1Heading = literal.Content.ToString();
+                            }
                         }
                     }
                 }
@@ -144,7 +232,7 @@ namespace DocFxChapterNumbers
             return fileName.Replace(sourceDirectoryBase, targetDirectoryBase);
         }
 
-        private static MarkdownDocument LoadDocument(string fileName)
+        private static MarkdownDocument LoadMarkdownDocument(string fileName)
         {
             var pipeline = new MarkdownPipelineBuilder().UseAdvancedExtensions().Build();
             return MarkdownParser.Parse(File.ReadAllText(fileName), pipeline);
@@ -154,7 +242,7 @@ namespace DocFxChapterNumbers
         {
             Console.WriteLine("Creating {0}", fileName);
 
-            string directoryName = Path.GetDirectoryName(fileName);
+            string directoryName = Path.GetDirectoryName(fileName)!;
             if (!Directory.Exists(directoryName))
             {
                 Directory.CreateDirectory(directoryName);
@@ -175,10 +263,9 @@ namespace DocFxChapterNumbers
             }
         }
 
-
-        private static void ProcessContentFile(Chapter chapter, string contentFile, string targetFile, ref string currentLevel1Heading)
+        private static void ProcessContentFile(Chapter chapter, string contentFile, string targetFile, ref string? currentLevel1Heading)
         {
-            var doc = LoadDocument(contentFile);
+            var doc = LoadMarkdownDocument(contentFile);
 
             foreach (var x in doc.Descendants<HeadingBlock>())
             {
@@ -187,11 +274,14 @@ namespace DocFxChapterNumbers
                     chapter.IncrementLevel(x.Level + 1);
                 }
 
-                foreach (var s in x.Inline)
+                if (x.Inline != null)
                 {
-                    if (s is LiteralInline literal)
+                    foreach (var s in x.Inline)
                     {
-                        literal.UpdateContent(c => chapter + " " + c);
+                        if (s is LiteralInline literal)
+                        {
+                            literal.UpdateContent(c => chapter + " " + c);
+                        }
                     }
                 }
             }
@@ -285,6 +375,16 @@ namespace DocFxChapterNumbers
         }
     }
 
+    public class YamlTocItem
+    {
+        [YamlMember(Alias = "name")]
+        public string? Name { get; set; }
+        [YamlMember(Alias = "href")]
+        public string? HRef { get; set; }
+        [YamlMember(Alias = "items")]
+        public List<YamlTocItem> Items { get; set; } = [];
+    }
+
     public class Chapter
     {
         private int m_level1;
@@ -306,6 +406,20 @@ namespace DocFxChapterNumbers
             m_level4 = other.m_level4;
             m_level5 = other.m_level5;
             m_level6 = other.m_level6;
+        }
+
+        public int Level
+        {
+            get
+            {
+                if (m_level6 > 0) return 6;
+                if (m_level5 > 0) return 5;
+                if (m_level4 > 0) return 4;
+                if (m_level3 > 0) return 3;
+                if (m_level2 > 0) return 2;
+                if (m_level1 > 0) return 1;
+                return 0;
+            }
         }
 
         public void IncrementLevel(int level)
@@ -380,27 +494,27 @@ namespace DocFxChapterNumbers
 
                 if (m_level2 > 0)
                 {
-                    sb.Append(".");
+                    sb.Append('.');
                     sb.Append(m_level2);
 
                     if (m_level3 > 0)
                     {
-                        sb.Append(".");
+                        sb.Append('.');
                         sb.Append(m_level3);
 
                         if (m_level4 > 0)
                         {
-                            sb.Append(".");
+                            sb.Append('.');
                             sb.Append(m_level4);
 
                             if (m_level5 > 0)
                             {
-                                sb.Append(".");
+                                sb.Append('.');
                                 sb.Append(m_level5);
 
                                 if (m_level6 > 0)
                                 {
-                                    sb.Append(".");
+                                    sb.Append('.');
                                     sb.Append(m_level6);
                                 }
                             }
